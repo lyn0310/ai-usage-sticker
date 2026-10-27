@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Claude.ai 실사용량 스티커 위젯 — 멀티 계정 버전
+AI 사용량 스티커 위젯 — Claude / ChatGPT(Codex) 멀티 계정
+- 계정마다 Claude 또는 ChatGPT를 선택해서 추가 (탭의 색 점으로 구분: 주황=Claude, 초록=ChatGPT)
+  · Claude  : claude.ai 5시간 세션 / 주간 사용량
+  · ChatGPT : chatgpt.com Codex 사용 한도 (5시간 / 주간)
 - 계정마다 독립된 브라우저 프로필 폴더 사용 → 로그인/로그아웃 충돌 없음
   (Edge/Chrome은 실행 파일만 빌려 쓰고, 평소 쓰는 브라우저 프로필은 건드리지 않음)
-- 스티커 상단 탭으로 계정 전환, [＋]로 계정 추가
 - 모든 계정 사용량을 백그라운드에서 함께 갱신 → 탭 전환 시 즉시 표시
-- 5시간 세션 / 주간 전체 / 주간 모델별 게이지 + 리셋 카운트다운
-- 팀에 속한 계정은 개인/팀 중 어느 플랜 사용량을 볼지 선택 (로그인 직후 자동 표시, 우클릭 → 조직 선택)
+- 둥근 스티커 디자인, 우하단 모서리 드래그 또는 Ctrl+휠로 크기 조절(70~200%)
+- Claude 팀 계정은 개인/팀 중 어느 플랜 사용량을 볼지 선택 (우클릭 → 조직 선택)
 - 드래그로 위치 이동, ✕=종료 · –=작업표시줄로 축소(작업표시줄 아이콘 클릭 시 복귀)
-- 우클릭 메뉴: 새로고침/계정 추가/조직 선택/재로그인/삭제/위젯 크기(85~175%)/종료
 - 세션 만료 시 프로필 폴더에서 조용히 자동 복원 시도 → 안 되면 "재로그인 필요" 표시
 
-실행:   python claude_usage_sticker_login.py
-진단:   python claude_usage_sticker_login.py --dump
-Edge로: python claude_usage_sticker_login.py --browser edge   (로그인 창을 Edge로)
-구방식: python claude_usage_sticker_login.py --profile work   (인스턴스 자체를 분리 실행)
-필요:   pip install curl_cffi playwright
+실행:   python ai_usage_sticker.py
+진단:   python ai_usage_sticker.py --dump
+Edge로: python ai_usage_sticker.py --browser edge   (로그인 창을 Edge로)
+구방식: python ai_usage_sticker.py --profile work   (인스턴스 자체를 분리 실행)
+필요:   pip install curl_cffi playwright pillow
         playwright install chromium   (Edge/Chrome이 설치된 PC라면 생략 가능)
 """
 
@@ -27,9 +28,12 @@ import shutil
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 BASE = "https://claude.ai"
+GPT_BASE = "https://chatgpt.com"
+GPT_USAGE_URL = f"{GPT_BASE}/backend-api/wham/usage"
+GPT_SESSION_COOKIE = "__Secure-next-auth.session-token"   # 길면 .0/.1 로 쪼개져 저장됨
 
 # exe(PyInstaller --windowed)로 실행될 때 대응
 if getattr(sys, "frozen", False):
@@ -43,11 +47,33 @@ if getattr(sys, "frozen", False):
 else:
     DIR = os.path.dirname(os.path.abspath(__file__))
 
-CONFIG_FILE = os.path.join(DIR, "claude_sticker_config.json")
+CONFIG_FILE = os.path.join(DIR, "ai_usage_config.json")
+LEGACY_CONFIG_FILE = os.path.join(DIR, "claude_sticker_config.json")   # 구버전 설정 자동 이전
 BROWSER_CHANNEL = None   # None=내장 크로미움, "msedge"=Edge, "chrome"=설치된 크롬
 PROFILE_LABEL = ""       # --profile 이름 (인스턴스 분리 실행용, 제목에 표시)
-ICON_NAME = "claude_sticker.ico"
+ICON_NAME = "ai_usage_sticker.ico"
 THEMES_DIRNAME = "themes"   # exe/스크립트 옆의 테마 폴더
+
+# 서비스별 표시 정보
+PROVIDERS = {
+    "claude": {
+        "label": "Claude",
+        "color": "#d97757",
+        "login_url": f"{BASE}/login",
+        "rows": {"session": "5시간 세션", "weekly": "주간 · 전체"},
+    },
+    "gpt": {
+        "label": "ChatGPT",
+        "color": "#19c37d",
+        "login_url": f"{GPT_BASE}/auth/login",
+        "rows": {"session": "Codex · 5시간", "weekly": "Codex · 주간"},
+    },
+}
+
+
+def provider_of(acc):
+    p = (acc or {}).get("provider", "claude")
+    return p if p in PROVIDERS else "claude"
 
 
 def resource_path(name):
@@ -80,23 +106,36 @@ def list_themes():
 
 
 DEFAULT_CONFIG = {
-    "accounts": {},        # 계정이름 -> {"session_key": "", "org_uuid": ""}
+    # 계정이름 -> {"provider": "claude", "session_key": "", "org_uuid": ""}
+    #           또는 {"provider": "gpt", "cookies": {...}, "user_agent": ""}
+    "accounts": {},
     "active_account": "",
-    "usage_url": "",       # 비워두면 후보 URL 자동 시도. {org} 플레이스홀더 사용 가능
+    "usage_url": "",       # (Claude) 비워두면 후보 URL 자동 시도. {org} 플레이스홀더 사용 가능
     "poll_seconds": 60,
-    "scale": 1.0,          # 위젯 크기 배율 (0.85 ~ 1.75)
+    "scale": 1.0,          # 위젯 크기 배율 (SCALE_MIN ~ SCALE_MAX)
     "theme": "",           # "" = 기본 막대 게이지, 그 외 = themes/<이름> 폴더 사용
     "win_x": 100,
     "win_y": 100,
 }
 
-BG, FG, SUB = "#2b2620", "#e8e0d4", "#a89f90"
-ACCENT, WARN, DANGER, TRACK = "#d97757", "#e3b341", "#e05d44", "#4a4238"
-TAB_ACTIVE_BG = "#403830"
-ALPHA = 0.97   # 창 투명도 (낮을수록 뒷화면이 비쳐 글씨가 안 보일 수 있음)
+SCALE_MIN, SCALE_MAX = 0.7, 2.0
+
+# 모던 다크 팔레트
+BG = "#1c1c21"          # 스티커 카드
+MENU_BG = "#202026"     # 메뉴/대화상자 카드
+FG, SUB = "#ededf2", "#8e8e9a"
+TRACK = "#33333b"       # 게이지 바탕
+HOVER = "#2e2e36"       # 메뉴 항목 hover
+BORDER = "#34343d"
+SEG_BG, SEG_ON = "#2a2a31", "#41414c"
+FIELD = "#16161a"
+WARN, DANGER = "#e8b04a", "#ef5f5f"
+KEY = "#010203"         # 창 투명 처리용 색 (둥근 모서리 바깥 부분)
+ALPHA = 0.97            # 창 투명도 (낮을수록 뒷화면이 비쳐 글씨가 안 보일 수 있음)
+UI_FONT = "Malgun Gothic"
+NUM_FONT = "Segoe UI Semibold"
 
 ROW_KEYS = ("session", "weekly")
-ROW_NAMES = {"session": "5시간 세션", "weekly": "주간 · 전체"}
 
 EXPIRED = "__EXPIRED__"   # 내부용: 세션 만료 표식
 
@@ -109,16 +148,24 @@ def safe_name(name):
 
 
 def profile_dir_for(name):
-    prefix = f"claude_login_profile_{PROFILE_LABEL}_" if PROFILE_LABEL else "claude_login_profile_"
-    return os.path.join(DIR, prefix + safe_name(name))
+    label = f"{PROFILE_LABEL}_" if PROFILE_LABEL else ""
+    path = os.path.join(DIR, f"ai_login_profile_{label}" + safe_name(name))
+    legacy = os.path.join(DIR, f"claude_login_profile_{label}" + safe_name(name))
+    if not os.path.isdir(path) and os.path.isdir(legacy):
+        try:
+            os.rename(legacy, path)   # 구버전 이름의 로그인 프로필 재활용
+        except Exception:
+            return legacy             # 사용 중이라 못 옮기면 옛 폴더 그대로 사용
+    return path
 
 
 # ---------------- 설정 ----------------
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
-    if os.path.exists(CONFIG_FILE):
+    src = CONFIG_FILE if os.path.exists(CONFIG_FILE) else LEGACY_CONFIG_FILE
+    if os.path.exists(src):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(src, "r", encoding="utf-8") as f:
                 cfg.update(json.load(f))
         except Exception:
             pass
@@ -142,8 +189,12 @@ def load_config():
 
     if not isinstance(cfg.get("accounts"), dict):
         cfg["accounts"] = {}
+    for acc in cfg["accounts"].values():
+        acc.setdefault("provider", "claude")   # 구버전 계정은 모두 Claude
     if cfg["accounts"] and cfg.get("active_account") not in cfg["accounts"]:
         cfg["active_account"] = next(iter(cfg["accounts"]))
+    if src != CONFIG_FILE:
+        save_config(cfg)
     return cfg
 
 
@@ -156,26 +207,37 @@ def save_config(cfg):
 
 
 # ---------------- HTTP ----------------
-def http_get(url, session_key):
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/126.0.0.0 Safari/537.36"),
-        "Accept": "application/json",
-        "Referer": "https://claude.ai/",
-    }
-    cookies = {"sessionKey": session_key}
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/126.0.0.0 Safari/537.36")
+
+
+def _request(url, headers=None, cookies=None, ua=None):
+    """GET 요청. (status, json 또는 텍스트, 응답이 새로 준 쿠키 dict) 반환."""
+    h = {"User-Agent": ua or DEFAULT_UA, "Accept": "application/json"}
+    h.update(headers or {})
     try:
         from curl_cffi import requests as creq
-        r = creq.get(url, headers=headers, cookies=cookies,
+        r = creq.get(url, headers=h, cookies=cookies or {},
                      impersonate="chrome", timeout=15)
     except ImportError:
         import requests
-        r = requests.get(url, headers=headers, cookies=cookies, timeout=15)
+        r = requests.get(url, headers=h, cookies=cookies or {}, timeout=15)
     try:
-        return r.status_code, r.json()
+        new_cookies = dict(r.cookies)
     except Exception:
-        return r.status_code, getattr(r, "text", "")[:500]
+        new_cookies = {}
+    try:
+        return r.status_code, r.json(), new_cookies
+    except Exception:
+        return r.status_code, getattr(r, "text", "")[:500], new_cookies
+
+
+def http_get(url, session_key):
+    """Claude API 요청 (sessionKey 쿠키)."""
+    status, data, _ = _request(url, headers={"Referer": "https://claude.ai/"},
+                               cookies={"sessionKey": session_key})
+    return status, data
 
 
 def key_alive(session_key):
@@ -221,9 +283,92 @@ def usage_url_candidates(cfg, org):
     ]
 
 
+# ----- ChatGPT -----
+def gpt_has_session(cookies):
+    return any(k.startswith(GPT_SESSION_COOKIE) for k in (cookies or {}))
+
+
+def gpt_session(acc):
+    """chatgpt.com 로그인 쿠키로 access token 발급. (token, account_id, err) 반환.
+    응답이 갱신해 준 쿠키는 acc["cookies"]에 반영함(호출 측에서 저장)."""
+    cookies = acc.get("cookies") or {}
+    if not gpt_has_session(cookies):
+        return None, None, EXPIRED
+    status, data, new_cookies = _request(
+        f"{GPT_BASE}/api/auth/session", headers={"Referer": f"{GPT_BASE}/"},
+        cookies=cookies, ua=acc.get("user_agent"))
+    if new_cookies:
+        cookies.update(new_cookies)
+        acc["cookies"] = cookies
+    if status == 200 and isinstance(data, dict):
+        token = data.get("accessToken")
+        if token:
+            return token, (data.get("account") or {}).get("id"), None
+        return None, None, EXPIRED   # 로그아웃 상태면 빈 {}가 옴
+    if status == 401:
+        return None, None, EXPIRED
+    if status == 403:
+        return None, None, "403"
+    return None, None, f"HTTP {status}"
+
+
+def gpt_usage_request(acc):
+    """(status, data) — Codex 사용량 API 직접 호출."""
+    token, account_id, err = gpt_session(acc)
+    if err == EXPIRED:
+        return 401, None
+    if err == "403":
+        return 403, None
+    if err:
+        return 0, err
+    headers = {"Authorization": f"Bearer {token}", "Referer": f"{GPT_BASE}/codex"}
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+    status, data, _ = _request(GPT_USAGE_URL, headers=headers,
+                               cookies=acc.get("cookies"), ua=acc.get("user_agent"))
+    return status, data
+
+
+def gpt_fetch_via_browser(profile_dir):
+    """Cloudflare가 직접 요청을 막을 때: 저장된 프로필로 브라우저를 조용히 띄워
+    페이지 안에서 fetch. (status, data) 반환."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return 0, None
+    try:
+        with sync_playwright() as p:
+            ctx = _launch_ctx(p, headless=True, profile_dir=profile_dir)
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto(f"{GPT_BASE}/", timeout=45000, wait_until="domcontentloaded")
+            res = page.evaluate("""async (url) => {
+                const s = await fetch('/api/auth/session', {credentials: 'include'})
+                    .then(r => r.json()).catch(() => ({}));
+                if (!s.accessToken) return {status: 401, data: null};
+                const h = {'Authorization': 'Bearer ' + s.accessToken};
+                if (s.account && s.account.id) h['ChatGPT-Account-Id'] = s.account.id;
+                const r = await fetch(url, {headers: h, credentials: 'include'});
+                let d = null;
+                try { d = await r.json(); } catch (e) {}
+                return {status: r.status, data: d};
+            }""", GPT_USAGE_URL)
+            ctx.close()
+            return (res or {}).get("status", 0), (res or {}).get("data")
+    except Exception:
+        return 0, None
+
+
+def account_alive(acc):
+    if provider_of(acc) == "gpt":
+        return gpt_session(acc)[0] is not None
+    return key_alive(acc.get("session_key"))
+
+
 def fetch_usage(cfg, name):
     """지정 계정의 사용량 조회. (parsed, 상태메시지) 반환. 만료면 (None, EXPIRED)."""
     acc = cfg["accounts"].get(name) or {}
+    if provider_of(acc) == "gpt":
+        return fetch_gpt_usage(cfg, name)
     key = acc.get("session_key", "")
     if not key:
         return None, "로그인 필요 — 우클릭 → 재로그인"
@@ -245,6 +390,28 @@ def fetch_usage(cfg, name):
         else:
             last = f"HTTP {status}"
     return None, last
+
+
+def fetch_gpt_usage(cfg, name):
+    acc = cfg["accounts"].get(name) or {}
+    if not acc.get("cookies"):
+        return None, "로그인 필요 — 우클릭 → 재로그인"
+    status, data = gpt_usage_request(acc)
+    save_config(cfg)   # 갱신된 세션 쿠키 저장
+    if status == 403:
+        status, data = gpt_fetch_via_browser(profile_dir_for(name))
+    if status == 200 and isinstance(data, dict):
+        parsed = parse_gpt_usage(data)
+        if parsed:
+            return parsed, "갱신 " + datetime.now().strftime("%H:%M:%S")
+        return None, "Codex 사용 기록 없음/파싱 실패 — --dump로 확인"
+    if status == 401:
+        return None, EXPIRED
+    if status == 403:
+        return None, "차단됨(403) — 재로그인 해보세요"
+    if isinstance(data, str) and status == 0:
+        return None, data
+    return None, f"HTTP {status}" if status else "응답 없음"
 
 
 # ---------------- 응답 파싱 ----------------
@@ -324,14 +491,47 @@ def parse_usage(data):
     return result
 
 
+def parse_gpt_usage(data):
+    """Codex 사용량 응답: rate_limit.primary_window / secondary_window 의
+    used_percent, reset_at(또는 reset_after_seconds), limit_window_seconds."""
+    rl = data.get("rate_limit") if isinstance(data.get("rate_limit"), dict) else data
+    now = datetime.now(timezone.utc)
+    result = {}
+    for wkey, fallback in (("primary_window", "session"), ("secondary_window", "weekly")):
+        w = rl.get(wkey)
+        if not isinstance(w, dict) or not isinstance(w.get("used_percent"), (int, float)):
+            continue
+        secs = w.get("limit_window_seconds")
+        kind = fallback
+        if isinstance(secs, (int, float)) and secs > 0:
+            kind = "session" if secs <= 6 * 3600 else "weekly"
+        resets = parse_resets_at(w.get("reset_at")) if w.get("reset_at") else None
+        if resets is None and isinstance(w.get("reset_after_seconds"), (int, float)):
+            resets = now + timedelta(seconds=w["reset_after_seconds"])
+        if kind not in result:
+            result[kind] = {
+                "label": wkey,
+                "ratio": max(0.0, min(1.0, w["used_percent"] / 100.0)),
+                "detail": "",
+                "resets_at": resets,
+            }
+    return result
+
+
 # ---------------- 브라우저 로그인 ----------------
-def _find_session_key(ctx):
+def _find_cred(ctx, provider):
+    """브라우저 쿠키에서 로그인 정보 추출. 로그인 전이면 None."""
     try:
-        for c in ctx.cookies():
-            if c.get("name") == "sessionKey" and "claude.ai" in c.get("domain", ""):
-                return c.get("value")
+        cookies = ctx.cookies()
     except Exception:
-        pass
+        return None
+    if provider == "gpt":
+        jar = {c["name"]: c["value"] for c in cookies
+               if "chatgpt.com" in c.get("domain", "")}
+        return {"cookies": jar} if gpt_has_session(jar) else None
+    for c in cookies:
+        if c.get("name") == "sessionKey" and "claude.ai" in c.get("domain", ""):
+            return {"session_key": c.get("value")}
     return None
 
 
@@ -352,7 +552,7 @@ def _launch_ctx(p, headless, profile_dir):
     raise last_err
 
 
-def read_key_from_profile(profile_dir):
+def read_cred_from_profile(profile_dir, provider):
     """저장된 브라우저 프로필에서 조용히(headless) 세션 복원 시도."""
     if not os.path.isdir(profile_dir):
         return None
@@ -363,15 +563,15 @@ def read_key_from_profile(profile_dir):
     try:
         with sync_playwright() as p:
             ctx = _launch_ctx(p, headless=True, profile_dir=profile_dir)
-            key = _find_session_key(ctx)
+            cred = _find_cred(ctx, provider)
             ctx.close()
-            return key
+            return cred
     except Exception:
         return None
 
 
-def interactive_login(profile_dir, timeout_sec=600):
-    """브라우저 창을 띄워 사용자가 직접 로그인. 완료되면 sessionKey 반환."""
+def interactive_login(profile_dir, provider="claude", timeout_sec=600):
+    """브라우저 창을 띄워 사용자가 직접 로그인. 완료되면 (로그인정보 dict, None) 반환."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -381,32 +581,45 @@ def interactive_login(profile_dir, timeout_sec=600):
             ctx = _launch_ctx(p, headless=False, profile_dir=profile_dir)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
-                page.goto(f"{BASE}/login", timeout=60000)
+                page.goto(PROVIDERS[provider]["login_url"], timeout=60000)
             except Exception:
                 pass
-            key, t0 = None, time.time()
+            cred, t0 = None, time.time()
             while time.time() - t0 < timeout_sec:
-                key = _find_session_key(ctx)
-                if key:
+                cred = _find_cred(ctx, provider)
+                if cred:
                     break
                 if not ctx.pages:  # 사용자가 창을 닫음
                     return None, "브라우저가 닫혔어요 (로그인 미완료)"
                 time.sleep(1)
+            if cred and provider == "gpt":
+                time.sleep(2)   # 로그인 직후 나머지 쿠키(cf_clearance 등)가 붙을 때까지
+                cred = _find_cred(ctx, provider) or cred
+                try:
+                    # Cloudflare 쿠키는 브라우저 UA와 묶여 있어 같은 UA로 요청해야 함
+                    cred["user_agent"] = page.evaluate("navigator.userAgent")
+                except Exception:
+                    pass
             ctx.close()
-            return (key, None) if key else (None, "로그인 시간 초과")
+            return (cred, None) if cred else (None, "로그인 시간 초과")
     except Exception as e:
         return None, f"브라우저 실행 실패: {e}"
 
 
 def try_silent_restore(cfg, name):
-    """프로필 폴더에서 새 sessionKey를 조용히 복원. 성공 시 True."""
-    key = read_key_from_profile(profile_dir_for(name))
-    if key and key_alive(key):
-        acc = cfg["accounts"].get(name)
-        if acc is not None:
-            acc["session_key"] = key   # org_uuid(조직 선택)는 유지
-            save_config(cfg)
-            return True
+    """프로필 폴더에서 새 로그인 정보를 조용히 복원. 성공 시 True."""
+    acc = cfg["accounts"].get(name)
+    if acc is None:
+        return False
+    cred = read_cred_from_profile(profile_dir_for(name), provider_of(acc))
+    if not cred:
+        return False
+    candidate = dict(acc)
+    candidate.update(cred)
+    if account_alive(candidate):
+        acc.update(candidate)   # org_uuid(조직 선택)·user_agent는 유지
+        save_config(cfg)
+        return True
     return False
 
 
@@ -415,19 +628,35 @@ def dump_mode():
     cfg = load_config()
     name = cfg.get("active_account") or "계정1"
     if name not in cfg["accounts"]:
-        cfg["accounts"][name] = {"session_key": "", "org_uuid": ""}
+        cfg["accounts"][name] = {"provider": "claude", "session_key": "", "org_uuid": ""}
         cfg["active_account"] = name
     acc = cfg["accounts"][name]
+    provider = provider_of(acc)
 
-    if not key_alive(acc.get("session_key")):
+    if not account_alive(acc):
         if not try_silent_restore(cfg, name):
-            key, err = interactive_login(profile_dir_for(name))
-            if not key:
+            cred, err = interactive_login(profile_dir_for(name), provider)
+            if not cred:
                 print(f"[로그인 실패] {err}")
                 return
-            acc["session_key"], acc["org_uuid"] = key, ""
+            acc.update(cred)
+            acc["org_uuid"] = ""
             save_config(cfg)
-    print(f"[계정] {name}")
+    print(f"[계정] {name} ({PROVIDERS[provider]['label']})")
+
+    if provider == "gpt":
+        print(f"\n[1] GET {GPT_USAGE_URL}")
+        status, data = gpt_usage_request(acc)
+        if status == 403:
+            print("    403 → 브라우저 경유 재시도")
+            status, data = gpt_fetch_via_browser(profile_dir_for(name))
+        save_config(cfg)
+        print(f"    HTTP {status}")
+        text = json.dumps(data, ensure_ascii=False, indent=2) if isinstance(data, (dict, list)) else str(data)
+        print(text[:3000])
+        if status == 200 and isinstance(data, dict):
+            print("\n    → 파싱 결과:", parse_gpt_usage(data))
+        return
 
     print("\n[1] /api/organizations")
     status, data = http_get(f"{BASE}/api/organizations", acc["session_key"])
@@ -450,6 +679,28 @@ def dump_mode():
 
 
 # ---------------- UI ----------------
+def round_rect(cv, x1, y1, x2, y2, r, **kw):
+    """캔버스에 둥근 사각형(부드러운 다각형). r을 높이의 절반으로 주면 알약 모양."""
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    pts = [x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1,
+           x2, y1 + r, x2, y1 + r, x2, y2 - r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2, x1, y2,
+           x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1]
+    kw.setdefault("outline", "")
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+def mouse_button_down():
+    """왼쪽 마우스 버튼이 눌려 있는지 (크기 조절 드래그 추적용)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000)
+        except Exception:
+            pass
+    return False
+
+
 class ThemeImages:
     """themes/<이름> 폴더의 단계별 이미지를 불러와 잔여량에 맞는 프레임을 제공.
     - 파일 정렬 순서대로 0%→100%(잔여량) 단계로 간주 (예: stage00~stage10).
@@ -516,6 +767,53 @@ class ThemeImages:
             return None
 
 
+class Pill:
+    """알약 모양 버튼/탭/배지 (Canvas). 선택적으로 왼쪽에 색 점."""
+
+    def __init__(self, app, parent, text, bg, fill=None, fg=FG, font=None,
+                 padx=8, pady=2, dot=None, hover_fill=None):
+        import tkinter.font as tkfont
+        self.app, self.text, self.fill, self.fg, self.dot = app, text, fill, fg, dot
+        self.hover_fill = hover_fill
+        self.font = font or app.fnt(8)
+        f = tkfont.Font(root=app.root, font=self.font)
+        self.padx = app.px(padx)
+        self.dotw = app.px(11) if dot else 0
+        self.w = f.measure(text) + 2 * self.padx + self.dotw
+        self.h = f.metrics("linespace") + 2 * app.px(pady)
+        self.cv = app.tk.Canvas(parent, width=self.w, height=self.h, bg=bg,
+                                highlightthickness=0, bd=0, cursor="hand2")
+        self._hover = False
+        if hover_fill:
+            self.cv.bind("<Enter>", lambda e: self._set_hover(True), add="+")
+            self.cv.bind("<Leave>", lambda e: self._set_hover(False), add="+")
+        self.draw()
+
+    def _set_hover(self, v):
+        self._hover = v
+        self.draw()
+
+    def draw(self):
+        cv, w, h = self.cv, self.w, self.h
+        cv.delete("all")
+        fill = self.hover_fill if (self._hover and self.hover_fill) else self.fill
+        if fill:
+            round_rect(cv, 0, 0, w - 1, h - 1, h / 2, fill=fill)
+        x = self.padx
+        if self.dot:
+            r = self.app.px(3)
+            cv.create_oval(x, h / 2 - r, x + 2 * r, h / 2 + r, fill=self.dot, outline="")
+            x += self.dotw
+        cv.create_text(x + (w - self.padx - x) / 2, h / 2, text=self.text,
+                       fill=self.fg, font=self.font)
+
+    def bind(self, seq, fn):
+        self.cv.bind(seq, fn, add="+")
+
+    def pack(self, **kw):
+        self.cv.pack(**kw)
+
+
 class LiveSticker:
     def __init__(self, cfg):
         import tkinter as tk
@@ -531,11 +829,14 @@ class LiveSticker:
         self._drag_ox = self._drag_oy = 0
         self._drag_active = False
         self._tip_win = None
+        self._resize = None
+        self._wheel_save = None
 
         try:
             self.scale = float(cfg.get("scale", 1.0)) or 1.0
         except Exception:
             self.scale = 1.0
+        self.scale = max(SCALE_MIN, min(SCALE_MAX, self.scale))
         self._minimized = False
 
         self.theme = ThemeImages()
@@ -546,19 +847,20 @@ class LiveSticker:
             try:
                 import ctypes
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                    "claude.usage.sticker")
+                    "ai.usage.sticker")
             except Exception:
                 pass
 
         self.root = tk.Tk()
-        self.root.title("Claude 사용량")          # 축소 시 작업표시줄에 표시될 이름
+        self.root.title("AI 사용량")          # 축소 시 작업표시줄에 표시될 이름
         self._set_icon()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", ALPHA)
-        self.root.configure(bg=BG)
+        self._make_transparent(self.root)
         self.root.geometry(f"+{cfg['win_x']}+{cfg['win_y']}")   # 크기는 내용에 맞춰 자동
         self.root.bind("<Map>", self._on_map)
+        self.root.bind_all("<Control-MouseWheel>", self._on_ctrl_wheel)
 
         self.build_ui()
         self.rebuild_tabs()
@@ -598,15 +900,23 @@ class LiveSticker:
 
     def fnt(self, size, bold=False):
         s = max(7, int(round(size * self.scale)))
-        return ("Malgun Gothic", s, "bold") if bold else ("Malgun Gothic", s)
+        return (UI_FONT, s, "bold") if bold else (UI_FONT, s)
 
-    def mono(self, size):
-        return ("Consolas", max(7, int(round(size * self.scale))), "bold")
+    def num(self, size):
+        return (NUM_FONT, max(7, int(round(size * self.scale))))
 
-    def set_scale(self, s):
+    def _prov(self, name=None):
+        name = self.cfg.get("active_account", "") if name is None else name
+        return PROVIDERS[provider_of(self.cfg["accounts"].get(name))]
+
+    def set_scale(self, s, save=True):
+        s = round(max(SCALE_MIN, min(SCALE_MAX, s)) * 20) / 20   # 5% 단위
+        if abs(s - self.scale) < 0.001:
+            return
         self.scale = s
         self.cfg["scale"] = s
-        save_config(self.cfg)
+        if save:
+            save_config(self.cfg)
         self._rebuild_all()
 
     def set_theme(self, theme_name):
@@ -621,12 +931,41 @@ class LiveSticker:
         self._rebuild_all()
 
     def _rebuild_all(self):
+        self._hide_tip()
         for w in self.root.winfo_children():
-            w.destroy()
+            if not isinstance(w, self.tk.Toplevel):
+                w.destroy()
         self.build_ui()
         self.rebuild_tabs()
         self.rebuild_menu()
         self.render()
+
+    # ----- 크기 조절: 우하단 그립 드래그 / Ctrl+휠 -----
+    def _start_resize(self, e):
+        self._resize = {"x0": e.x_root, "y0": e.y_root, "s0": self.scale,
+                        "w0": max(1, self.root.winfo_width())}
+        self._resize_poll()
+
+    def _resize_poll(self):
+        """그립 위젯은 크기 변경 때마다 다시 만들어져 드래그 이벤트가 끊기므로,
+        마우스 위치/버튼 상태를 직접 읽어서 추적."""
+        st = self._resize
+        if not st:
+            return
+        mx, my = self.root.winfo_pointerxy()
+        d = ((mx - st["x0"]) + (my - st["y0"])) / 2
+        self.set_scale(st["s0"] * (st["w0"] + d) / st["w0"], save=False)
+        if mouse_button_down():
+            self.root.after(30, self._resize_poll)
+        else:
+            self._resize = None
+            save_config(self.cfg)
+
+    def _on_ctrl_wheel(self, e):
+        self.set_scale(self.scale + (0.05 if e.delta > 0 else -0.05), save=False)
+        if self._wheel_save:
+            self.root.after_cancel(self._wheel_save)
+        self._wheel_save = self.root.after(600, lambda: save_config(self.cfg))
 
     # ----- 축소(작업표시줄) / 복귀 -----
     def minimize(self):
@@ -644,35 +983,79 @@ class LiveSticker:
             self.root.attributes("-topmost", True)
             self.root.attributes("-alpha", ALPHA)
 
+    # ----- 둥근 창 껍데기 -----
+    @staticmethod
+    def _make_transparent(win):
+        win.configure(bg=KEY)
+        try:
+            win.attributes("-transparentcolor", KEY)   # 둥근 모서리 바깥을 투명하게
+        except Exception:
+            pass
+
+    def _round_shell(self, win, radius, fill, pad):
+        """win 안에 둥근 카드(Canvas)를 깔고, 내용을 담을 Frame을 돌려줌.
+        내용 크기가 바뀌면 카드도 자동으로 다시 그림. win._refresh()로 즉시 갱신 가능."""
+        tk = self.tk
+        cv = tk.Canvas(win, bg=KEY, highlightthickness=0, bd=0)
+        cv.pack()
+        body = tk.Frame(cv, bg=fill)
+        p, r = self.px(pad), self.px(radius)
+        cv.create_window(p, p, window=body, anchor="nw")
+        last = {"size": None}
+
+        def refresh(e=None):
+            w = body.winfo_reqwidth() + 2 * p
+            h = body.winfo_reqheight() + 2 * p
+            if last["size"] == (w, h):
+                return
+            last["size"] = (w, h)
+            cv.config(width=w, height=h)
+            cv.delete("shape")
+            round_rect(cv, 0, 0, w - 1, h - 1, r, fill=fill, outline=BORDER, tags="shape")
+            cv.tag_lower("shape")
+
+        body.bind("<Configure>", refresh)
+        win._refresh = refresh
+        return cv, body
+
+    def _popup(self, radius=14, pad=8):
+        win = self.tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        self._make_transparent(win)
+        _, body = self._round_shell(win, radius, MENU_BG, pad)
+        return win, body
+
     # ----- UI 구성 -----
     def build_ui(self):
         tk = self.tk
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(fill="x", padx=self.px(10), pady=(self.px(7), 0))
-        title_text = "Claude 사용량" + (f" · {PROFILE_LABEL}" if PROFILE_LABEL else "")
+        self.shell, self.body = self._round_shell(self.root, 18, BG, 10)
+        body = self.body
+        self.make_draggable(self.shell)
+        self.make_draggable(body)
+
+        head = tk.Frame(body, bg=BG)
+        head.pack(fill="x", padx=self.px(4), pady=(self.px(2), 0))
+        title_text = "AI 사용량" + (f" · {PROFILE_LABEL}" if PROFILE_LABEL else "")
         title = tk.Label(head, text=title_text, bg=BG, fg=FG, font=self.fnt(9, True))
         title.pack(side="left")
+        self.prov_lbl = tk.Label(head, text="", bg=BG, fg=SUB, font=self.fnt(8, True))
+        self.prov_lbl.pack(side="left", padx=(self.px(6), 0))
 
-        # 우상단 ✕(종료) / –(작업표시줄로 축소)
-        close_b = tk.Label(head, text=" ✕ ", bg=BG, fg=SUB, font=self.fnt(9, True),
-                           cursor="hand2")
-        close_b.pack(side="right")
-        close_b.bind("<Button-1>", lambda e: self.quit())
-        close_b.bind("<Enter>", lambda e: close_b.config(fg=DANGER))
-        close_b.bind("<Leave>", lambda e: close_b.config(fg=SUB))
-        min_b = tk.Label(head, text=" – ", bg=BG, fg=SUB, font=self.fnt(9, True),
-                         cursor="hand2")
-        min_b.pack(side="right")
-        min_b.bind("<Button-1>", lambda e: self.minimize())
-        min_b.bind("<Enter>", lambda e: min_b.config(fg=FG))
-        min_b.bind("<Leave>", lambda e: min_b.config(fg=SUB))
+        # 우상단 ✕(종료) / –(작업표시줄로 축소) — 동그란 hover 버튼
+        for glyph, cmd, hov in (("✕", self.quit, DANGER), ("–", self.minimize, SEG_ON)):
+            b = Pill(self, head, glyph, bg=BG, fg=SUB, font=self.fnt(8, True),
+                     padx=5, pady=1, hover_fill=hov)
+            b.pack(side="right", padx=(self.px(2), 0))
+            b.bind("<Button-1>", lambda e, c=cmd: c())
 
         self.make_draggable(head)
         self.make_draggable(title)
+        self.make_draggable(self.prov_lbl)
 
         # 계정 탭 바
-        self.tabbar = tk.Frame(self.root, bg=BG)
-        self.tabbar.pack(fill="x", padx=self.px(10), pady=(self.px(2), self.px(3)))
+        self.tabbar = tk.Frame(body, bg=BG)
+        self.tabbar.pack(fill="x", padx=self.px(2), pady=(self.px(6), self.px(6)))
         self.make_draggable(self.tabbar)
 
         self.rows = {}
@@ -681,26 +1064,39 @@ class LiveSticker:
         else:
             self._build_bar_rows()
 
-        self.status_lbl = tk.Label(self.root, text="시작 중…", bg=BG, fg=SUB,
-                                   font=self.fnt(8), anchor="w")
-        self.status_lbl.pack(fill="x", padx=self.px(10), pady=(0, self.px(6)))
+        foot = tk.Frame(body, bg=BG)
+        foot.pack(fill="x", padx=self.px(4))
+        self.status_lbl = tk.Label(foot, text="시작 중…", bg=BG, fg=SUB, font=self.fnt(8),
+                                   anchor="w", justify="left", wraplength=self.px(205))
+        self.status_lbl.pack(side="left", fill="x", expand=True)
+        self.make_draggable(foot)
         self.make_draggable(self.status_lbl)
-        self.make_draggable(self.root)
+
+        # 우하단 크기 조절 그립
+        g = self.px(12)
+        grip = tk.Canvas(foot, width=g, height=g, bg=BG, highlightthickness=0,
+                         cursor="size_nw_se")
+        grip.pack(side="right", anchor="se")
+        r = max(1, self.px(1.2))
+        for cx, cy in ((g - 3 * r, g - 3 * r), (g - 3 * r, g - 7 * r), (g - 7 * r, g - 3 * r)):
+            grip.create_oval(cx - r, cy - r, cx + r, cy + r, fill=SUB, outline="")
+        grip.bind("<Button-1>", self._start_resize)
+        grip.bind("<Button-3>", lambda e: self.show_menu(e.x_root, e.y_root))
 
     def _build_bar_rows(self):
         """기본 막대 게이지 (세로로 세션/주간 2줄)."""
         tk = self.tk
         for key in ROW_KEYS:
-            line = tk.Frame(self.root, bg=BG)
-            line.pack(fill="x", padx=self.px(10))
-            name_lbl = tk.Label(line, text=ROW_NAMES[key], bg=BG, fg=SUB, font=self.fnt(8))
+            line = tk.Frame(self.body, bg=BG)
+            line.pack(fill="x", padx=self.px(4))
+            name_lbl = tk.Label(line, text="", bg=BG, fg=SUB, font=self.fnt(8))
             name_lbl.pack(side="left")
-            pct_lbl = tk.Label(line, text="--%", bg=BG, fg=FG, font=self.mono(9))
+            pct_lbl = tk.Label(line, text="--%", bg=BG, fg=FG, font=self.num(9))
             pct_lbl.pack(side="right")
-            bar = tk.Canvas(self.root, width=self.px(232), height=self.px(11),
+            bar = tk.Canvas(self.body, width=self.px(232), height=self.px(10),
                             bg=BG, highlightthickness=0)
-            bar.pack(padx=self.px(10), pady=(0, self.px(4)))
-            for w in (line, name_lbl):
+            bar.pack(padx=self.px(4), pady=(self.px(1), self.px(7)))
+            for w in (line, name_lbl, pct_lbl):
                 self.make_draggable(w)
             self.make_draggable(bar)
             self.rows[key] = {"name": name_lbl, "pct": pct_lbl, "bar": bar}
@@ -710,8 +1106,8 @@ class LiveSticker:
         tk = self.tk
         tree_h = self._tree_height()
         tree_w = self._tree_width()
-        holder = tk.Frame(self.root, bg=BG)
-        holder.pack(padx=self.px(10), pady=(self.px(4), self.px(8)))
+        holder = tk.Frame(self.body, bg=BG)
+        holder.pack(pady=(self.px(2), self.px(6)))
         self.make_draggable(holder)
         for key in ROW_KEYS:
             cv = tk.Canvas(holder, width=tree_w, height=tree_h,
@@ -740,18 +1136,11 @@ class LiveSticker:
 
     def _show_tip(self, e, key):
         self._hide_tip()
-        text = self._tip_text(key)
-        tk = self.tk
-        tip = tk.Toplevel(self.root)
-        tip.overrideredirect(True)
-        tip.attributes("-topmost", True)
-        tip.configure(bg=TRACK)
-        lbl = tk.Label(tip, text=text, bg=TRACK, fg=FG, font=self.fnt(8),
-                       padx=self.px(8), pady=self.px(3), justify="left")
-        lbl.pack()
-        tip.update_idletasks()
-        tip.geometry(f"+{e.x_root + 12}+{e.y_root + 12}")
-        self._tip_win = tip
+        win, body = self._popup(radius=10, pad=4)
+        self.tk.Label(body, text=self._tip_text(key), bg=MENU_BG, fg=FG, font=self.fnt(8),
+                      padx=self.px(6), pady=self.px(2), justify="left").pack()
+        self.place_popup(win, e.x_root + 12, e.y_root + 12)
+        self._tip_win = win
 
     def _hide_tip(self):
         win = getattr(self, "_tip_win", None)
@@ -768,10 +1157,9 @@ class LiveSticker:
         with self._lock:
             usage = dict(self.usage.get(active) or {})
         info = usage.get(key)
-        name = ROW_NAMES.get(key, key)
+        name = self._prov()["rows"].get(key, key)
         if not info:
             return f"{name}: --"
-        from datetime import datetime, timezone
         txt = f"{name}: {info['ratio']*100:.0f}% 사용"
         if info.get("detail"):
             txt += f" ({info['detail']})"
@@ -784,23 +1172,22 @@ class LiveSticker:
         return txt
 
     def rebuild_tabs(self):
-        tk = self.tk
         x, y = self.root.winfo_x(), self.root.winfo_y()
         for w in self.tabbar.winfo_children():
             w.destroy()
         for name in self.cfg["accounts"]:
             active = (name == self.cfg.get("active_account"))
-            lbl = tk.Label(self.tabbar, text=name,
-                           bg=TAB_ACTIVE_BG if active else BG,
-                           fg=FG if active else SUB,
-                           font=self.fnt(8),
-                           padx=self.px(6), pady=0)
-            lbl.pack(side="left", padx=(0, self.px(4)))
-            lbl.bind("<Button-1>", lambda e, n=name: self.switch_account(n))
-            lbl.bind("<Double-Button-1>", lambda e, n=name: self.rename_account(n))
-            lbl.bind("<Button-3>", lambda e: self.show_menu(e.x_root, e.y_root))
-        plus = tk.Label(self.tabbar, text="＋", bg=BG, fg=SUB,
-                        font=self.fnt(9, True), padx=self.px(4))
+            tab = Pill(self, self.tabbar, name, bg=BG,
+                       fill=SEG_ON if active else None,
+                       fg=FG if active else SUB, font=self.fnt(8, active),
+                       padx=8, pady=2, dot=self._prov(name)["color"],
+                       hover_fill=SEG_ON if active else HOVER)
+            tab.pack(side="left", padx=(0, self.px(4)))
+            tab.bind("<Button-1>", lambda e, n=name: self.switch_account(n))
+            tab.bind("<Double-Button-1>", lambda e, n=name: self.rename_account(n))
+            tab.bind("<Button-3>", lambda e: self.show_menu(e.x_root, e.y_root))
+        plus = Pill(self, self.tabbar, "＋", bg=BG, fg=SUB, font=self.fnt(8, True),
+                    padx=6, pady=2, hover_fill=HOVER)
         plus.pack(side="left")
         plus.bind("<Button-1>", lambda e: self.add_account())
         plus.bind("<Button-3>", lambda e: self.show_menu(e.x_root, e.y_root))
@@ -814,6 +1201,8 @@ class LiveSticker:
         if getattr(self, "_dragging", False):
             return
         self.root.update_idletasks()
+        self.root._refresh()
+        self.root.update_idletasks()
         w = self.root.winfo_reqwidth()
         h = self.root.winfo_reqheight()
         self.root.geometry(f"{w}x{h}+{x}+{y}")
@@ -822,7 +1211,7 @@ class LiveSticker:
         # 커스텀 메뉴는 열 때마다 새로 그리므로, 열려 있는 메뉴만 닫음
         self._close_menu()
 
-    # ----- 커스텀 다크 팝업/대화상자 -----
+    # ----- 팝업 위치 -----
     def _monitor_workarea(self, x, y):
         """(x, y) 지점이 속한 모니터의 작업 영역 (left, top, right, bottom).
         듀얼/멀티 모니터 대응. 실패 시 주 모니터 기준으로 폴백."""
@@ -855,12 +1244,19 @@ class LiveSticker:
     def place_popup(self, win, x, y):
         """팝업이 '해당 모니터' 밖으로 나가지 않게 위치 보정 (멀티 모니터 대응)."""
         win.update_idletasks()
+        if hasattr(win, "_refresh"):
+            win._refresh()
+            win.update_idletasks()
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
         left, top, right, bottom = self._monitor_workarea(x, y)
         x = max(left, min(x, right - w - 4))
         y = max(top, min(y, bottom - h - 4))
         win.geometry(f"+{x}+{y}")
 
+    def _below_sticker(self):
+        return self.root.winfo_x(), self.root.winfo_y() + self.root.winfo_height() + 6
+
+    # ----- 메뉴 부품 -----
     def _close_menu(self):
         win = getattr(self, "_menu_win", None)
         if win is not None:
@@ -870,105 +1266,197 @@ class LiveSticker:
                 pass
             self._menu_win = None
 
-    def show_menu(self, x, y):
-        """스티커와 같은 다크 테마의 우클릭 메뉴."""
+    def _menu_row(self, parent, width, text, cmd, icon="", fg=FG, hint="",
+                  dot=None, bold=False):
+        """메뉴 한 줄: 왼쪽 아이콘(또는 색 점) · 글자 · 오른쪽 보조 문구.
+        마우스를 올리면 둥근 하이라이트."""
         tk = self.tk
+        h = self.px(30)
+        cv = tk.Canvas(parent, width=width, height=h, bg=MENU_BG,
+                       highlightthickness=0, cursor="hand2")
+        cv.pack()
+
+        def draw(hover=False):
+            cv.delete("all")
+            if hover:
+                round_rect(cv, 0, 1, width - 1, h - 2, self.px(8), fill=HOVER)
+            cx = self.px(16)
+            if dot:
+                r = self.px(4)
+                cv.create_oval(cx - r, h / 2 - r, cx + r, h / 2 + r, fill=dot, outline="")
+            elif icon:
+                cv.create_text(cx, h / 2, text=icon, fill=fg if fg != FG else SUB,
+                               font=self.fnt(9))
+            cv.create_text(self.px(32), h / 2, text=text, anchor="w", fill=fg,
+                           font=self.fnt(9, bold))
+            if hint:
+                cv.create_text(width - self.px(12), h / 2, text=hint, anchor="e",
+                               fill=SUB, font=self.fnt(8))
+
+        draw()
+        cv.bind("<Enter>", lambda e: draw(True))
+        cv.bind("<Leave>", lambda e: draw(False))
+        cv.bind("<Button-1>", lambda e: cmd())
+        return cv
+
+    def _menu_section(self, parent, text, hint=""):
+        tk = self.tk
+        row = tk.Frame(parent, bg=MENU_BG)
+        row.pack(fill="x", padx=self.px(10), pady=(self.px(8), self.px(2)))
+        tk.Label(row, text=text, bg=MENU_BG, fg=SUB, font=self.fnt(7, True)).pack(side="left")
+        if hint:
+            tk.Label(row, text=hint, bg=MENU_BG, fg=SUB, font=self.fnt(7)).pack(side="right")
+
+    def _menu_sep(self, parent):
+        self.tk.Frame(parent, bg=BORDER, height=1).pack(fill="x", padx=self.px(8),
+                                                        pady=self.px(5))
+
+    def _segmented(self, parent, width, options, current, on_pick, colors=None, bg=MENU_BG):
+        """세그먼트 선택 컨트롤 (iOS/Win11 스타일). options = [(표시, 값), ...]."""
+        tk = self.tk
+        h, n = self.px(28), max(1, len(options))
+        cv = tk.Canvas(parent, width=width, height=h, bg=bg,
+                       highlightthickness=0, cursor="hand2")
+        state = {"cur": current}
+
+        def draw():
+            cv.delete("all")
+            round_rect(cv, 0, 0, width - 1, h - 1, self.px(9), fill=SEG_BG)
+            sw = width / n
+            for i, (label, val) in enumerate(options):
+                on = (val == state["cur"])
+                x1 = i * sw
+                if on:
+                    round_rect(cv, x1 + 3, 3, x1 + sw - 3, h - 4, self.px(7),
+                               fill=(colors or {}).get(val, SEG_ON))
+                cv.create_text(x1 + sw / 2, h / 2, text=label,
+                               fill=FG if on else SUB, font=self.fnt(8, on))
+
+        def click(e):
+            i = min(n - 1, max(0, int(e.x // (width / n))))
+            state["cur"] = options[i][1]
+            draw()
+            on_pick(state["cur"])
+
+        cv.bind("<Button-1>", click)
+        draw()
+        return cv
+
+    def _button_row(self, parent, specs):
+        """둥근 알약 버튼들 (오른쪽 정렬). specs = [(글자, 콜백, 채움색), ...]."""
+        row = self.tk.Frame(parent, bg=MENU_BG)
+        row.pack(fill="x", padx=self.px(10), pady=(self.px(6), self.px(6)))
+        for text, cmd, color in reversed(specs):
+            primary = color not in (SEG_BG, SEG_ON)
+            b = Pill(self, row, text, bg=MENU_BG, fill=color,
+                     fg="white" if primary else FG, font=self.fnt(9, primary),
+                     padx=14, pady=4, hover_fill=SEG_ON if not primary else None)
+            b.pack(side="right", padx=(self.px(6), 0))
+            b.bind("<Button-1>", cmd)
+
+    def _entry(self, parent, width, initial=""):
+        """둥근 입력칸. 포커스 시 테두리가 강조색으로."""
+        tk = self.tk
+        h = self.px(32)
+        cv = tk.Canvas(parent, width=width, height=h, bg=MENU_BG, highlightthickness=0)
+        cv.pack(padx=self.px(10), pady=(self.px(2), self.px(4)))
+        frame = round_rect(cv, 0, 0, width - 1, h - 1, self.px(9), fill=FIELD, outline=BORDER)
+        ent = tk.Entry(cv, bg=FIELD, fg=FG, insertbackground=FG, relief="flat", bd=0,
+                       highlightthickness=0, font=self.fnt(9))
+        cv.create_window(self.px(12), h // 2, window=ent, anchor="w",
+                         width=width - self.px(24))
+        ent.insert(0, initial)
+        ent.select_range(0, "end")
+        ent.bind("<FocusIn>", lambda e: cv.itemconfig(frame, outline=self._prov()["color"]))
+        ent.bind("<FocusOut>", lambda e: cv.itemconfig(frame, outline=BORDER))
+        return ent
+
+    def _dialog_title(self, body, title, sub=""):
+        tk = self.tk
+        tk.Label(body, text=title, bg=MENU_BG, fg=FG, font=self.fnt(10, True), anchor="w"
+                 ).pack(fill="x", padx=self.px(10), pady=(self.px(6), 0))
+        if sub:
+            tk.Label(body, text=sub, bg=MENU_BG, fg=SUB, font=self.fnt(8), anchor="w",
+                     justify="left", wraplength=self.px(240)
+                     ).pack(fill="x", padx=self.px(10), pady=(self.px(2), self.px(4)))
+
+    # ----- 우클릭 메뉴 -----
+    def show_menu(self, x, y):
+        """둥근 카드형 우클릭 메뉴."""
+        import tkinter.font as tkfont
         self._close_menu()
+        self._hide_tip()
         active = self.cfg.get("active_account", "")
-        win = tk.Toplevel(self.root)
+        win, body = self._popup(radius=14, pad=6)
         self._menu_win = win
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.configure(bg=BG, highlightbackground=TRACK, highlightthickness=1)
 
-        def add_item(text, cmd, fg=FG):
-            lbl = tk.Label(win, text=text, bg=BG, fg=fg, anchor="w",
-                           font=self.fnt(9), padx=self.px(12), pady=self.px(4))
-            lbl.pack(fill="x")
-            lbl.bind("<Button-1>", lambda e: (self._close_menu(), cmd()))
-            lbl.bind("<Enter>", lambda e, w=lbl: w.config(bg=TAB_ACTIVE_BG))
-            lbl.bind("<Leave>", lambda e, w=lbl: w.config(bg=BG))
+        def act(cmd):
+            return lambda: (self._close_menu(), cmd())
 
-        def add_sep():
-            tk.Frame(win, bg=TRACK, height=1).pack(fill="x", padx=self.px(10),
-                                                   pady=self.px(3))
-
-        add_item("지금 새로고침", self.schedule_fetch)
-        if self.cfg["accounts"]:
-            add_sep()
-            for n in self.cfg["accounts"]:
-                mark = "● " if n == active else "○ "
-                add_item(mark + n, lambda n=n: self.switch_account(n))
-        add_sep()
-        add_item("계정 추가…", self.add_account)
+        # 메뉴 폭: 가장 긴 항목 기준
+        f = tkfont.Font(root=self.root, font=self.fnt(9))
+        texts = ["계정 추가…", "작업표시줄로 축소"] + [n + "  ChatGPT ✓" for n in self.cfg["accounts"]]
         if active:
-            add_item(f"'{active}' 이름 변경…",
-                     lambda n=active: self.rename_account(n))
-            add_item(f"'{active}' 조직 선택…",
-                     lambda n=active: self.maybe_choose_org(n, force=True))
-            add_item(f"'{active}' 재로그인", self.relogin)
-            add_item(f"'{active}' 삭제", self.remove_account)
-        add_sep()
-        row = tk.Frame(win, bg=BG)
-        row.pack(fill="x", padx=self.px(12), pady=self.px(2))
-        tk.Label(row, text="크기", bg=BG, fg=SUB, font=self.fnt(8)).pack(side="left")
-        for pct in (85, 100, 125, 150, 175):
-            cur = abs(self.scale - pct / 100) < 0.01
-            b = tk.Label(row, text=str(pct), bg=TAB_ACTIVE_BG if cur else BG,
-                         fg=FG if cur else SUB, font=self.fnt(8),
-                         padx=self.px(4), cursor="hand2")
-            b.pack(side="left", padx=self.px(2))
-            b.bind("<Button-1>",
-                   lambda e, p=pct: (self._close_menu(), self.set_scale(p / 100)))
+            texts.append(f"'{active}' 조직 선택…")
+        W = max(self.px(232), max(f.measure(t) for t in texts) + self.px(60))
 
-        # 테마 선택: 기본(막대) + themes 폴더에서 찾은 테마들
+        self._menu_row(body, W, "지금 새로고침", act(self.schedule_fetch), icon="↻")
+        if self.cfg["accounts"]:
+            self._menu_section(body, "계정")
+            for n in self.cfg["accounts"]:
+                hint = self._prov(n)["label"] + ("  ✓" if n == active else "")
+                self._menu_row(body, W, n, act(lambda n=n: self.switch_account(n)),
+                               dot=self._prov(n)["color"], hint=hint, bold=(n == active))
+        self._menu_row(body, W, "계정 추가…", act(self.add_account), icon="＋")
+        if active:
+            self._menu_sep(body)
+            self._menu_row(body, W, "이름 변경…", act(lambda: self.rename_account(active)),
+                           icon="✎", hint=active)
+            if provider_of(self.cfg["accounts"].get(active)) == "claude":
+                self._menu_row(body, W, "조직 선택…",
+                               act(lambda: self.maybe_choose_org(active, force=True)),
+                               icon="⇄", hint="개인 / 팀")
+            self._menu_row(body, W, "재로그인", act(self.relogin), icon="⟲")
+            self._menu_row(body, W, "계정 삭제", act(self.remove_account), icon="✕", fg=DANGER)
+
+        self._menu_section(body, "크기", f"{self.scale*100:.0f}%  ·  모서리 드래그 / Ctrl+휠")
+        sizes = [(str(p), p / 100) for p in (85, 100, 125, 150, 175)]
+        cur = next((v for _, v in sizes if abs(v - self.scale) < 0.01), None)
+        seg = self._segmented(body, W - self.px(16), sizes, cur,
+                              lambda v: (self._close_menu(), self.set_scale(v)))
+        seg.pack(padx=self.px(8))
+
         themes = list_themes()
-        trow = tk.Frame(win, bg=BG)
-        trow.pack(fill="x", padx=self.px(12), pady=self.px(2))
-        tk.Label(trow, text="테마", bg=BG, fg=SUB, font=self.fnt(8)).pack(side="left")
+        self._menu_section(body, "테마", "" if themes else "themes 폴더 비어있음")
         opts = [("기본", "")] + [(t, t) for t in themes]
-        for label, val in opts:
-            cur = (self.cfg.get("theme", "") == val)
-            b = tk.Label(trow, text=label, bg=TAB_ACTIVE_BG if cur else BG,
-                         fg=FG if cur else SUB, font=self.fnt(8),
-                         padx=self.px(4), cursor="hand2")
-            b.pack(side="left", padx=self.px(2))
-            b.bind("<Button-1>",
-                   lambda e, v=val: (self._close_menu(), self.set_theme(v)))
-        if not themes:
-            tk.Label(trow, text="(themes 폴더 비어있음)", bg=BG, fg=SUB,
-                     font=self.fnt(7)).pack(side="left", padx=self.px(4))
+        seg = self._segmented(body, W - self.px(16), opts, self.cfg.get("theme", ""),
+                              lambda v: (self._close_menu(), self.set_theme(v)))
+        seg.pack(padx=self.px(8))
 
-        add_item("작업표시줄로 축소", self.minimize)
-        add_sep()
-        add_item("종료", self.quit, fg=DANGER)
+        self._menu_sep(body)
+        self._menu_row(body, W, "작업표시줄로 축소", act(self.minimize), icon="–")
+        self._menu_row(body, W, "종료", act(self.quit), icon="⏻", fg=DANGER)
 
         self.place_popup(win, x, y)
         win.after(10, win.focus_force)
         win.bind("<FocusOut>", lambda e: self._close_menu())
         win.bind("<Escape>", lambda e: self._close_menu())
 
-    def _dialog_base(self, title):
-        tk = self.tk
-        win = tk.Toplevel(self.root)
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.configure(bg=BG, highlightbackground=ACCENT, highlightthickness=1)
-        tk.Label(win, text=title, bg=BG, fg=FG, font=self.fnt(9, True)
-                 ).pack(padx=self.px(14), pady=(self.px(10), self.px(2)))
-        return win
+    # ----- 대화상자 -----
+    def _run_modal(self, win, ent=None):
+        self.place_popup(win, *self._below_sticker())
+        win.grab_set()
+        if ent is not None:
+            ent.focus_set()
+        else:
+            win.focus_force()
+        self.root.wait_window(win)
 
     def ask_text(self, title, prompt, initial=""):
-        """다크 테마 텍스트 입력 대화상자. 취소 시 None."""
-        tk = self.tk
-        win = self._dialog_base(title)
-        tk.Label(win, text=prompt, bg=BG, fg=SUB, font=self.fnt(8),
-                 justify="left", wraplength=self.px(220)).pack(padx=self.px(14))
-        ent = tk.Entry(win, bg=TAB_ACTIVE_BG, fg=FG, insertbackground=FG,
-                       relief="flat", font=self.fnt(9), width=22)
-        ent.pack(padx=self.px(14), pady=self.px(8), ipady=self.px(3))
-        ent.insert(0, initial)
-        ent.select_range(0, "end")
+        """텍스트 입력 대화상자. 취소 시 None."""
+        win, body = self._popup()
+        self._dialog_title(body, title, prompt)
+        ent = self._entry(body, self.px(240), initial)
         result = {"v": None}
 
         def ok(e=None):
@@ -978,23 +1466,64 @@ class LiveSticker:
         def cancel(e=None):
             win.destroy()
 
-        self._dialog_buttons(win, [("확인", ok, ACCENT), ("취소", cancel, TRACK)])
+        self._button_row(body, [("취소", cancel, SEG_BG), ("확인", ok, self._prov()["color"])])
         win.bind("<Return>", ok)
         win.bind("<Escape>", cancel)
-        self.place_popup(win, self.root.winfo_x(),
-                         self.root.winfo_y() + self.root.winfo_height() + 6)
-        win.grab_set()
-        ent.focus_set()
-        self.root.wait_window(win)
+        self._run_modal(win, ent)
+        return result["v"]
+
+    def ask_account(self):
+        """계정 추가 대화상자: 서비스(Claude/ChatGPT) + 이름. 취소 시 None."""
+        tk = self.tk
+        win, body = self._popup()
+        self._dialog_title(body, "계정 추가", "어떤 서비스의 사용량을 볼까요?")
+        width = self.px(240)
+        state = {"prov": "claude", "edited": False}
+
+        def default_name(prov):
+            return self._unique_name(PROVIDERS[prov]["label"])
+
+        seg = self._segmented(body, width, [("Claude", "claude"), ("ChatGPT", "gpt")],
+                              "claude", lambda v: pick(v),
+                              colors={k: v["color"] for k, v in PROVIDERS.items()})
+        seg.pack(padx=self.px(10), pady=(self.px(2), self.px(6)))
+        note = tk.Label(body, text="", bg=MENU_BG, fg=SUB, font=self.fnt(7), anchor="w",
+                        justify="left", wraplength=width)
+        note.pack(fill="x", padx=self.px(10))
+        tk.Label(body, text="이름", bg=MENU_BG, fg=SUB, font=self.fnt(7, True), anchor="w"
+                 ).pack(fill="x", padx=self.px(10), pady=(self.px(6), 0))
+        ent = self._entry(body, width, default_name("claude"))
+        ent.bind("<Key>", lambda e: state.update(edited=True), add="+")
+        result = {"v": None}
+
+        def pick(prov):
+            state["prov"] = prov
+            note.config(text=("chatgpt.com 로그인 → Codex 5시간/주간 사용 한도를 표시해요"
+                              if prov == "gpt" else
+                              "claude.ai 로그인 → 5시간 세션/주간 사용량을 표시해요"))
+            if not state["edited"]:
+                ent.delete(0, "end")
+                ent.insert(0, default_name(prov))
+                ent.select_range(0, "end")
+
+        def ok(e=None):
+            result["v"] = (ent.get(), state["prov"])
+            win.destroy()
+
+        def cancel(e=None):
+            win.destroy()
+
+        pick("claude")
+        self._button_row(body, [("취소", cancel, SEG_BG), ("로그인", ok, "#5b6cff")])
+        win.bind("<Return>", ok)
+        win.bind("<Escape>", cancel)
+        self._run_modal(win, ent)
         return result["v"]
 
     def ask_confirm(self, title, prompt):
-        """다크 테마 예/아니오 대화상자."""
-        tk = self.tk
-        win = self._dialog_base(title)
-        tk.Label(win, text=prompt, bg=BG, fg=SUB, font=self.fnt(8),
-                 justify="left", wraplength=self.px(220)
-                 ).pack(padx=self.px(14), pady=self.px(4))
+        """삭제 확인 대화상자."""
+        win, body = self._popup()
+        self._dialog_title(body, title, prompt)
         result = {"v": False}
 
         def yes(e=None):
@@ -1004,25 +1533,11 @@ class LiveSticker:
         def no(e=None):
             win.destroy()
 
-        self._dialog_buttons(win, [("삭제", yes, DANGER), ("취소", no, TRACK)])
+        self._button_row(body, [("취소", no, SEG_BG), ("삭제", yes, DANGER)])
         win.bind("<Return>", yes)
         win.bind("<Escape>", no)
-        self.place_popup(win, self.root.winfo_x(),
-                         self.root.winfo_y() + self.root.winfo_height() + 6)
-        win.grab_set()
-        self.root.wait_window(win)
+        self._run_modal(win)
         return result["v"]
-
-    def _dialog_buttons(self, win, specs):
-        tk = self.tk
-        btns = tk.Frame(win, bg=BG)
-        btns.pack(pady=(self.px(2), self.px(10)))
-        for text, cmd, color in specs:
-            b = tk.Label(btns, text=f"  {text}  ", bg=color,
-                         fg="white" if color in (ACCENT, DANGER) else FG,
-                         font=self.fnt(9), cursor="hand2", pady=self.px(2))
-            b.pack(side="left", padx=self.px(4))
-            b.bind("<Button-1>", cmd)
 
     def make_draggable(self, w):
         """드래그로 창 이동. 위젯마다 독립된 시작좌표를 쓰고(공유 _dx/_dy로 인한
@@ -1081,20 +1596,25 @@ class LiveSticker:
     def add_account(self):
         if self._logging_in:
             return
-        default = self._unique_name(f"계정{len(self.cfg['accounts']) + 1}")
-        name = self.ask_text("계정 추가", "계정 이름 (예: 개인, 회사)", default)
-        if name is None:
+        res = self.ask_account()
+        if res is None:
             return
-        name = self._unique_name(name.strip() or default)
+        name, provider = res
+        name = self._unique_name(name.strip() or PROVIDERS[provider]["label"])
 
         self._logging_in = True
-        self.set_status_now(f"'{name}' 로그인: 브라우저 창에서 로그인해 주세요…")
+        self.set_status_now(f"'{name}' 로그인: 브라우저 창에서 "
+                            f"{PROVIDERS[provider]['label']}에 로그인해 주세요…")
 
         def worker():
-            key, err = interactive_login(profile_dir_for(name))
+            cred, err = interactive_login(profile_dir_for(name), provider)
             with self._lock:
-                if key:
-                    self.cfg["accounts"][name] = {"session_key": key, "org_uuid": ""}
+                if cred:
+                    acc = {"provider": provider}
+                    acc.update(cred)
+                    if provider == "claude":
+                        acc["org_uuid"] = ""
+                    self.cfg["accounts"][name] = acc
                     self.cfg["active_account"] = name
                     save_config(self.cfg)
                     self.acc_status[name] = "로그인 완료"
@@ -1103,7 +1623,8 @@ class LiveSticker:
             self._logging_in = False
             self.root.after(0, self.rebuild_tabs)
             self.root.after(0, self.rebuild_menu)
-            self.root.after(0, lambda: self.maybe_choose_org(name))
+            if provider == "claude":
+                self.root.after(0, lambda: self.maybe_choose_org(name))
             self.schedule_fetch()
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1112,22 +1633,24 @@ class LiveSticker:
         name = self.cfg.get("active_account")
         if not name or self._logging_in:
             return
+        provider = provider_of(self.cfg["accounts"].get(name))
         self._logging_in = True
         self.set_status_now(f"'{name}' 재로그인: 브라우저 창에서 로그인해 주세요…")
 
         def worker():
-            key, err = interactive_login(profile_dir_for(name))
+            cred, err = interactive_login(profile_dir_for(name), provider)
             with self._lock:
-                if key:
+                if cred:
                     acc = self.cfg["accounts"].get(name)
                     if acc is not None:
-                        acc["session_key"] = key   # 조직 선택 유지(다른 계정이면 아래서 재확인)
+                        acc.update(cred)   # 조직 선택 유지(다른 계정이면 아래서 재확인)
                         save_config(self.cfg)
                     self.acc_status[name] = "로그인 완료"
                 else:
                     self.acc_status[name] = err or "로그인 실패"
             self._logging_in = False
-            self.root.after(0, lambda: self.maybe_choose_org(name))
+            if provider == "claude":
+                self.root.after(0, lambda: self.maybe_choose_org(name))
             self.schedule_fetch()
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1189,12 +1712,12 @@ class LiveSticker:
         self.rebuild_menu()
         self.render()
 
-    # ----- 조직(개인/팀) 선택 -----
+    # ----- 조직(개인/팀) 선택 — Claude 전용 -----
     def maybe_choose_org(self, name, force=False):
         """계정이 여러 조직(개인 플랜 + 팀 등)에 속하면 어느 쪽 사용량을 볼지 선택.
         팀에 초대된 계정이 개인 사용량만 보이던 문제의 해결 지점."""
         acc = self.cfg["accounts"].get(name)
-        if not acc or not acc.get("session_key"):
+        if not acc or not acc.get("session_key") or provider_of(acc) != "claude":
             return
 
         def worker():
@@ -1204,7 +1727,6 @@ class LiveSticker:
         threading.Thread(target=worker, daemon=True).start()
 
     def _org_dialog(self, name, orgs, err, force):
-        tk = self.tk
         acc = self.cfg["accounts"].get(name)
         if acc is None:
             return
@@ -1225,21 +1747,11 @@ class LiveSticker:
             save_config(self.cfg)
             return
 
-        win = tk.Toplevel(self.root)
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.configure(bg=BG, highlightbackground=TRACK, highlightthickness=1)
-        tk.Label(win, text=f"'{name}' — 사용량을 볼 플랜(조직) 선택", bg=BG, fg=FG,
-                 font=self.fnt(9, True), wraplength=self.px(250)
-                 ).pack(padx=self.px(12), pady=(self.px(10), self.px(6)))
+        win, body = self._popup()
+        self._dialog_title(body, "플랜(조직) 선택", f"'{name}' — 어느 플랜의 사용량을 볼까요?")
+        W = self.px(250)
         for o in orgs:
-            mark = "● " if o["uuid"] == cur else "○ "
-            b = tk.Label(win, text=mark + o["name"], bg=TRACK, fg=FG, anchor="w",
-                         padx=self.px(10), pady=self.px(5), font=self.fnt(9),
-                         cursor="hand2", justify="left", wraplength=self.px(240))
-            b.pack(fill="x", padx=self.px(12), pady=self.px(3))
-
-            def pick(e=None, u=o["uuid"], n=o["name"]):
+            def pick(u=o["uuid"], n=o["name"]):
                 a = self.cfg["accounts"].get(name)
                 if a is not None:
                     a["org_uuid"] = u
@@ -1250,14 +1762,10 @@ class LiveSticker:
                 win.destroy()
                 self.schedule_fetch()
 
-            b.bind("<Button-1>", pick)
-            b.bind("<Enter>", lambda e, w=b: w.config(bg=TAB_ACTIVE_BG))
-            b.bind("<Leave>", lambda e, w=b: w.config(bg=TRACK))
-        c = tk.Label(win, text="나중에", bg=BG, fg=SUB, font=self.fnt(8), cursor="hand2")
-        c.pack(pady=(self.px(2), self.px(8)))
-        c.bind("<Button-1>", lambda e: win.destroy())
-        self.place_popup(win, self.root.winfo_x(),
-                         self.root.winfo_y() + self.root.winfo_height() + 6)
+            self._menu_row(body, W, o["name"], pick, icon="●" if o["uuid"] == cur else "○",
+                           bold=(o["uuid"] == cur))
+        self._button_row(body, [("나중에", lambda e: win.destroy(), SEG_BG)])
+        self.place_popup(win, *self._below_sticker())
 
     # ----- 데이터 -----
     def set_status_now(self, text):
@@ -1266,30 +1774,16 @@ class LiveSticker:
             self.acc_status[name] = text
 
     def startup_worker(self):
-        """시작 시: 계정이 없으면 첫 로그인, 있으면 조용히 세션 점검 후 갱신."""
+        """시작 시: 계정이 없으면 계정 추가 창, 있으면 조용히 세션 점검 후 갱신."""
         if not self.cfg["accounts"]:
-            self._logging_in = True
-            name = "계정1"
             with self._lock:
-                self.acc_status[""] = "첫 로그인: 브라우저 창에서 로그인해 주세요…"
-            key, err = interactive_login(profile_dir_for(name))
-            with self._lock:
-                if key:
-                    self.cfg["accounts"][name] = {"session_key": key, "org_uuid": ""}
-                    self.cfg["active_account"] = name
-                    save_config(self.cfg)
-                    self.acc_status[name] = "로그인 완료"
-                else:
-                    self.acc_status[""] = err or "로그인 실패 — 우클릭 → 계정 추가"
-            self._logging_in = False
-            self.root.after(0, self.rebuild_tabs)
-            self.root.after(0, self.rebuild_menu)
-            self.root.after(0, lambda: self.maybe_choose_org(name))
-        else:
-            for name in list(self.cfg["accounts"]):
-                acc = self.cfg["accounts"][name]
-                if not key_alive(acc.get("session_key")):
-                    try_silent_restore(self.cfg, name)
+                self.acc_status[""] = "＋ 를 눌러 Claude / ChatGPT 계정을 추가하세요"
+            self.root.after(300, self.add_account)
+            return
+        for name in list(self.cfg["accounts"]):
+            acc = self.cfg["accounts"][name]
+            if not account_alive(acc):
+                try_silent_restore(self.cfg, name)
         self.schedule_fetch()
 
     def schedule_fetch(self):
@@ -1301,7 +1795,10 @@ class LiveSticker:
             return
         try:
             for name in list(self.cfg["accounts"].keys()):
-                parsed, msg = fetch_usage(self.cfg, name)
+                try:
+                    parsed, msg = fetch_usage(self.cfg, name)
+                except Exception as e:
+                    parsed, msg = None, f"오류: {e}"
                 if parsed is None and msg == EXPIRED:
                     # 프로필 폴더에서 조용히 복원 후 1회 재시도
                     if try_silent_restore(self.cfg, name):
@@ -1327,17 +1824,19 @@ class LiveSticker:
     def render(self):
         x, y = self.root.winfo_x(), self.root.winfo_y()
         active = self.cfg.get("active_account", "")
+        prov = self._prov()
         with self._lock:
             usage = dict(self.usage.get(active) or {})
             status = self.acc_status.get(active) or self.acc_status.get("") or ""
         now = datetime.now(timezone.utc)
+        self.prov_lbl.config(text=prov["label"] if active else "", fg=prov["color"])
         theme_mode = self.theme.ok
         for key, row in self.rows.items():
             info = usage.get(key)
             ratio = info["ratio"] if info else 0
             if not theme_mode:
                 # 기본 막대: 이름/퍼센트 라벨 갱신
-                row["name"].config(text=ROW_NAMES[key])
+                row["name"].config(text=prov["rows"][key])
                 if not info:
                     row["pct"].config(text="--%")
                 else:
@@ -1351,11 +1850,11 @@ class LiveSticker:
                             h, m = rem // 3600, (rem % 3600) // 60
                             txt += f" · {d}일 {h}h" if d > 0 else f" · {h}:{m:02d}"
                     row["pct"].config(text=txt)
-            self.draw_bar(row["bar"], ratio)
+            self.draw_bar(row["bar"], ratio, prov["color"])
         self.status_lbl.config(text=status)
         self._pin_geometry(x, y)
 
-    def draw_bar(self, cv, ratio):
+    def draw_bar(self, cv, ratio, accent):
         cv.delete("all")
         # 테마(나무): 잔여량(=1-사용률)에 맞는 이미지를 캔버스 폭에 맞춰 그림
         if self.theme.ok:
@@ -1368,28 +1867,19 @@ class LiveSticker:
                 cv.create_image(cv.winfo_reqwidth()//2, 0, anchor="n", image=photo)
                 cv._photo_ref = photo   # GC 방지
                 return
-        # 기본 막대 게이지
+        # 기본 막대 게이지 (양 끝이 둥근 알약형)
         w = self.px(232)
-        color = ACCENT
+        color = accent
         if ratio >= 0.95:
             color = DANGER
         elif ratio >= 0.8:
             color = WARN
-        h, r = self.px(11), self.px(5)
+        h = self.px(10)
         if abs(cv.winfo_reqheight() - h) > 1:
             cv.config(height=h)
-        self._round_rect(cv, 0, 0, w, h, r, fill=TRACK)
+        round_rect(cv, 0, 0, w - 1, h - 1, h / 2, fill=TRACK)
         if ratio > 0:
-            self._round_rect(cv, 0, 0, max(int(w * ratio), h), h, r, fill=color)
-
-    @staticmethod
-    def _round_rect(cv, x1, y1, x2, y2, r, **kw):
-        cv.create_arc(x1, y1, x1+2*r, y1+2*r, start=90, extent=90, style="pieslice", outline="", **kw)
-        cv.create_arc(x2-2*r, y1, x2, y1+2*r, start=0, extent=90, style="pieslice", outline="", **kw)
-        cv.create_arc(x1, y2-2*r, x1+2*r, y2, start=180, extent=90, style="pieslice", outline="", **kw)
-        cv.create_arc(x2-2*r, y2-2*r, x2, y2, start=270, extent=90, style="pieslice", outline="", **kw)
-        cv.create_rectangle(x1+r, y1, x2-r, y2, outline="", **kw)
-        cv.create_rectangle(x1, y1+r, x2, y2-r, outline="", **kw)
+            round_rect(cv, 0, 0, max(int(w * ratio), h) - 1, h - 1, h / 2, fill=color)
 
     def quit(self):
         self.cfg["win_x"], self.cfg["win_y"] = self.root.winfo_x(), self.root.winfo_y()
@@ -1408,7 +1898,8 @@ if __name__ == "__main__":
 
     if args.profile:
         PROFILE_LABEL = args.profile
-        CONFIG_FILE = os.path.join(DIR, f"claude_sticker_config_{args.profile}.json")
+        CONFIG_FILE = os.path.join(DIR, f"ai_usage_config_{args.profile}.json")
+        LEGACY_CONFIG_FILE = os.path.join(DIR, f"claude_sticker_config_{args.profile}.json")
     if args.browser:
         BROWSER_CHANNEL = {"edge": "msedge", "chrome": "chrome"}[args.browser]
     elif getattr(sys, "frozen", False):

@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('claude_sticker.ico', '.'), ('themes', 'themes')]
+datas = [('ai_usage_sticker.ico', '.'), ('themes', 'themes')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('playwright')
@@ -11,7 +11,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['claude_usage_sticker_login.py'],
+    ['ai_usage_sticker.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -31,7 +31,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='ClaudeSticker',
+    name='AIUsageSticker',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -44,5 +44,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['claude_sticker.ico'],
+    icon=['ai_usage_sticker.ico'],
 )
