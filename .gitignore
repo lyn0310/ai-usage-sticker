@@ -1,0 +1,16 @@
+# 로그인 세션 키가 들어있는 설정 파일 — 절대 커밋 금지
+*_config.json
+claude_sticker_config*.json
+ai_usage_config*.json
+
+# 계정별 브라우저 로그인 프로필 (쿠키/세션 포함)
+claude_login_profile*/
+ai_login_profile*/
+
+# 빌드 산출물 / 배포 폴더
+build/
+dist/
+app/
+*.exe
+__pycache__/
+*.pyc
