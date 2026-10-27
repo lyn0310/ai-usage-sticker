@@ -535,9 +535,10 @@ def _find_cred(ctx, provider):
     return None
 
 
-def _launch_ctx(p, headless, profile_dir):
+def _launch_ctx(p, headless, profile_dir, window=None):
     """지정 채널로 브라우저 실행. 실패하면 Edge → Chrome → 내장 크로미움 순 폴백.
-    profile_dir은 이 앱 전용 폴더라서, 평소 쓰는 Edge/Chrome 프로필과는 완전히 분리됨."""
+    profile_dir은 이 앱 전용 폴더라서, 평소 쓰는 Edge/Chrome 프로필과는 완전히 분리됨.
+    window=(x, y, w, h)를 주면 그 위치/크기로 창을 띄움 (스티커가 있는 모니터에 띄우기용)."""
     channels = [BROWSER_CHANNEL] + [c for c in ("msedge", "chrome", None)
                                     if c != BROWSER_CHANNEL]
     last_err = None
@@ -546,6 +547,10 @@ def _launch_ctx(p, headless, profile_dir):
             kwargs = {"headless": headless, "channel": ch}
             if not headless:
                 kwargs["args"] = ["--disable-blink-features=AutomationControlled"]
+                if window:
+                    x, y, w, h = window
+                    kwargs["args"] += [f"--window-position={x},{y}", f"--window-size={w},{h}"]
+                    kwargs["no_viewport"] = True   # 페이지가 창 크기에 맞춰지도록
             return p.chromium.launch_persistent_context(profile_dir, **kwargs)
         except Exception as e:
             last_err = e
@@ -570,7 +575,7 @@ def read_cred_from_profile(profile_dir, provider):
         return None
 
 
-def interactive_login(profile_dir, provider="claude", timeout_sec=600):
+def interactive_login(profile_dir, provider="claude", timeout_sec=600, window=None):
     """브라우저 창을 띄워 사용자가 직접 로그인. 완료되면 (로그인정보 dict, None) 반환."""
     try:
         from playwright.sync_api import sync_playwright
@@ -578,7 +583,7 @@ def interactive_login(profile_dir, provider="claude", timeout_sec=600):
         return None, "Playwright 미설치 → pip install playwright && playwright install chromium"
     try:
         with sync_playwright() as p:
-            ctx = _launch_ctx(p, headless=False, profile_dir=profile_dir)
+            ctx = _launch_ctx(p, headless=False, profile_dir=profile_dir, window=window)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
                 page.goto(PROVIDERS[provider]["login_url"], timeout=60000)
@@ -1190,6 +1195,7 @@ class LiveSticker:
                     padx=6, pady=2, hover_fill=HOVER)
         plus.pack(side="left")
         plus.bind("<Button-1>", lambda e: self.add_account())
+        self._plus_btn = plus.cv   # 계정 추가 창을 이 버튼 바로 위에 띄움
         plus.bind("<Button-3>", lambda e: self.show_menu(e.x_root, e.y_root))
         self._pin_geometry(x, y)
 
@@ -1241,20 +1247,47 @@ class LiveSticker:
         return (0, 0, self.root.winfo_screenwidth(),
                 self.root.winfo_screenheight() - 48)
 
-    def place_popup(self, win, x, y):
-        """팝업이 '해당 모니터' 밖으로 나가지 않게 위치 보정 (멀티 모니터 대응)."""
+    def place_popup(self, win, x, y, above=False):
+        """팝업이 '해당 모니터' 밖으로 나가지 않게 위치 보정 (멀티 모니터 대응).
+        above=True면 (x, y) 지점 바로 위에 팝업 아래쪽이 오도록 배치."""
         win.update_idletasks()
         if hasattr(win, "_refresh"):
             win._refresh()
             win.update_idletasks()
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
         left, top, right, bottom = self._monitor_workarea(x, y)
+        if above:
+            y -= h + 6
         x = max(left, min(x, right - w - 4))
         y = max(top, min(y, bottom - h - 4))
-        win.geometry(f"+{x}+{y}")
+        geo = f"+{x}+{y}"
+        win.geometry(geo)
+        # 화면에 뜨기 전에 grab_set 등이 먼저 실행되면 위치가 무시되고 주 모니터
+        # 좌상단(0,0)에 뜨는 문제 → 즉시 반영 + 실제로 뜬 직후 한 번 더 지정
+        win.bind("<Map>", lambda e: e.widget is win and win.geometry(geo), add="+")
+        win.update_idletasks()
 
     def _below_sticker(self):
         return self.root.winfo_x(), self.root.winfo_y() + self.root.winfo_height() + 6
+
+    def _above_plus(self):
+        """＋ 버튼 바로 위 지점 (버튼이 없으면 스티커 위쪽)."""
+        b = getattr(self, "_plus_btn", None)
+        try:
+            return b.winfo_rootx() - self.px(12), b.winfo_rooty()
+        except Exception:
+            return self.root.winfo_x(), self.root.winfo_y()
+
+    def _login_window_rect(self):
+        """로그인 브라우저 창 위치/크기: 스티커가 있는 모니터에서, 스티커 바로 옆(위쪽)."""
+        sx, sy = self.root.winfo_x(), self.root.winfo_y()
+        sw, sh = self.root.winfo_width(), self.root.winfo_height()
+        left, top, right, bottom = self._monitor_workarea(sx + sw // 2, sy + sh // 2)
+        w = min(1000, right - left - 40)
+        h = min(820, bottom - top - 40)
+        x = max(left + 20, min(sx + sw - w, right - w - 20))
+        y = sy - h - 10 if sy - h - 10 >= top else max(top + 20, min(sy + sh + 10, bottom - h - 20))
+        return x, y, w, h
 
     # ----- 메뉴 부품 -----
     def _close_menu(self):
@@ -1443,8 +1476,8 @@ class LiveSticker:
         win.bind("<Escape>", lambda e: self._close_menu())
 
     # ----- 대화상자 -----
-    def _run_modal(self, win, ent=None):
-        self.place_popup(win, *self._below_sticker())
+    def _run_modal(self, win, ent=None, at=None, above=False):
+        self.place_popup(win, *(at or self._below_sticker()), above=above)
         win.grab_set()
         if ent is not None:
             ent.focus_set()
@@ -1517,7 +1550,7 @@ class LiveSticker:
         self._button_row(body, [("취소", cancel, SEG_BG), ("로그인", ok, "#5b6cff")])
         win.bind("<Return>", ok)
         win.bind("<Escape>", cancel)
-        self._run_modal(win, ent)
+        self._run_modal(win, ent, at=self._above_plus(), above=True)
         return result["v"]
 
     def ask_confirm(self, title, prompt):
@@ -1605,9 +1638,10 @@ class LiveSticker:
         self._logging_in = True
         self.set_status_now(f"'{name}' 로그인: 브라우저 창에서 "
                             f"{PROVIDERS[provider]['label']}에 로그인해 주세요…")
+        window = self._login_window_rect()
 
         def worker():
-            cred, err = interactive_login(profile_dir_for(name), provider)
+            cred, err = interactive_login(profile_dir_for(name), provider, window=window)
             with self._lock:
                 if cred:
                     acc = {"provider": provider}
@@ -1636,9 +1670,10 @@ class LiveSticker:
         provider = provider_of(self.cfg["accounts"].get(name))
         self._logging_in = True
         self.set_status_now(f"'{name}' 재로그인: 브라우저 창에서 로그인해 주세요…")
+        window = self._login_window_rect()
 
         def worker():
-            cred, err = interactive_login(profile_dir_for(name), provider)
+            cred, err = interactive_login(profile_dir_for(name), provider, window=window)
             with self._lock:
                 if cred:
                     acc = self.cfg["accounts"].get(name)
