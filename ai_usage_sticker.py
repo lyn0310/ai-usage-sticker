@@ -1257,7 +1257,8 @@ class LiveSticker:
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
         left, top, right, bottom = self._monitor_workarea(x, y)
         if above:
-            y -= h + 6
+            # 위쪽 공간이 모자라면 (스티커가 화면 위쪽에 있을 때) 버튼 아래로
+            y = y - h - 6 if y - h - 6 >= top else y + self.px(26)
         x = max(left, min(x, right - w - 4))
         y = max(top, min(y, bottom - h - 4))
         geo = f"+{x}+{y}"
